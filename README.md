@@ -62,6 +62,13 @@ python3 build.py
 python3 package.py
 ```
 
+#### Manual build
+
+```cmd
+python3 onlypatch.py
+python3 onlybuild.py
+```
+
 A zip archive and an installer will be created under `build`.
 
 **NOTE**: If the build fails, you must take additional steps before re-running the build:
