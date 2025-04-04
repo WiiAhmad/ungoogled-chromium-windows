@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2019 The ungoogled-chromium Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file.
 """
-ungoogled-chromium build script for Microsoft Windows
+Script to build ungoogled-chromium
 """
 
 import sys
 import time
 import argparse
 import os
-import re
-import shutil
 import subprocess
 import ctypes
+import shutil
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'ungoogled-chromium' / 'utils'))
@@ -23,6 +19,7 @@ from _common import ENCODING, get_logger
 sys.path.pop(0)
 
 _ROOT_DIR = Path(__file__).resolve().parent
+
 
 def _get_vcvars_path(name='64'):
     """
@@ -88,61 +85,150 @@ def _run_build_process_timeout(*args, timeout):
             raise KeyboardInterrupt
 
 
+def _setup_rust_toolchain(source_tree):
+    """Setup Rust toolchain for build"""
+    HOST_CPU_IS_64BIT = sys.maxsize > 2**32
+    RUST_DIR_DST = source_tree / 'third_party' / 'rust-toolchain'
+    RUST_DIR_SRC64 = source_tree / 'third_party' / 'rust-toolchain-x64'
+    RUST_DIR_SRC86 = source_tree / 'third_party' / 'rust-toolchain-x86'
+    RUST_DIR_SRCARM = source_tree / 'third_party' / 'rust-toolchain-arm'
+    RUST_FLAG_FILE = RUST_DIR_DST / 'INSTALLED_VERSION'
+    
+    # Check if already setup
+    if RUST_FLAG_FILE.exists():
+        get_logger().info('Rust toolchain already set up')
+        return
+        
+    get_logger().info('Setting up Rust toolchain...')
+    
+    # Directories to copy from source to target folder
+    DIRS_TO_COPY = ['bin', 'lib']
+
+    # Loop over all source folders
+    for rust_dir_src in [RUST_DIR_SRC64, RUST_DIR_SRC86, RUST_DIR_SRCARM]:
+        # Loop over all dirs to copy
+        for dir_to_copy in DIRS_TO_COPY:
+            # Copy bin folder for host architecture
+            if (dir_to_copy == 'bin') and (HOST_CPU_IS_64BIT != (rust_dir_src == RUST_DIR_SRC64)):
+                continue
+
+            # Create target dir
+            target_dir = RUST_DIR_DST / dir_to_copy
+            if not os.path.isdir(target_dir):
+                os.makedirs(target_dir)
+
+            # Loop over all subfolders of the rust source dir
+            for cp_src in rust_dir_src.glob(f'*/{dir_to_copy}/*'):
+                cp_dst = target_dir / cp_src.name
+                if cp_src.is_dir():
+                    shutil.copytree(cp_src, cp_dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(cp_src, cp_dst)
+
+    # Generate version file
+    with open(RUST_FLAG_FILE, 'w') as f:
+        subprocess.run([source_tree / 'third_party' / 'rust-toolchain-x64' / 'rustc' / 'bin' / 'rustc.exe', '--version'], stdout=f)
+
+
+def _setup_build_config(source_tree, x86=False, arm=False):
+    """Setup build configuration"""
+    # Create output directory
+    build_dir = source_tree / 'out' / 'Default'
+    build_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if build configuration already exists
+    if (build_dir / 'args.gn').exists():
+        get_logger().info('Build configuration already set up')
+        return
+        
+    get_logger().info('Setting up build configuration...')
+    
+    # Output args.gn
+    gn_flags = (_ROOT_DIR / 'ungoogled-chromium' / 'flags.gn').read_text(encoding=ENCODING)
+    gn_flags += '\n'
+    windows_flags = (_ROOT_DIR / 'flags.windows.gn').read_text(encoding=ENCODING)
+    if x86:
+        windows_flags = windows_flags.replace('x64', 'x86')
+    elif arm:
+        windows_flags = windows_flags.replace('x64', 'arm64')
+    gn_flags += windows_flags
+    (build_dir / 'args.gn').write_text(gn_flags, encoding=ENCODING)
+
+
 def main():
     """CLI Entrypoint"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        '--ci',
-        action='store_true'
-    )
-    parser.add_argument(
         '--x86',
-        action='store_true'
-    )
+        action='store_true',
+        help='Target x86 architecture')
+    parser.add_argument(
+        '--arm',
+        action='store_true',
+        help='Target ARM64 architecture')
+    parser.add_argument(
+        '--ci',
+        action='store_true',
+        help='CI mode - build with timeout and package')
+    parser.add_argument(
+        '--skip-gn',
+        action='store_true',
+        help='Skip GN bootstrap and generation')
+    parser.add_argument(
+        '--skip-bindgen',
+        action='store_true',
+        help='Skip bindgen build')
     args = parser.parse_args()
 
     # Set common variables
     source_tree = _ROOT_DIR / 'build' / 'src'
 
-    if not args.ci or not (source_tree / 'out/Default').exists():
-        # Output args.gn
-        (source_tree / 'out/Default').mkdir(parents=True)
-        gn_flags = (_ROOT_DIR / 'ungoogled-chromium' / 'flags.gn').read_text(encoding=ENCODING)
-        gn_flags += '\n'
-        windows_flags = (_ROOT_DIR / 'flags.windows.gn').read_text(encoding=ENCODING)
-        if args.x86:
-            windows_flags = windows_flags.replace('x64', 'x86')
-        gn_flags += windows_flags
-        (source_tree / 'out/Default/args.gn').write_text(gn_flags, encoding=ENCODING)
+    # Check if source exists
+    if not source_tree.exists():
+        get_logger().error('Source tree does not exist. Run update_source.py first.')
+        exit(1)
+
+    # Setup Rust toolchain
+    _setup_rust_toolchain(source_tree)
+
+    # Setup build configuration
+    _setup_build_config(source_tree, args.x86, args.arm)
 
     # Enter source tree to run build commands
     os.chdir(source_tree)
 
-    if not args.ci or not os.path.exists('out\\Default\\gn.exe'):
-        # Run GN bootstrap
+    # Run GN bootstrap
+    if not args.skip_gn and not os.path.exists('out\\Default\\gn.exe'):
+        get_logger().info('Running GN bootstrap...')
         _run_build_process(
             sys.executable, 'tools\\gn\\bootstrap\\bootstrap.py', '-o', 'out\\Default\\gn.exe',
             '--skip-generate-buildfiles')
 
         # Run gn gen
+        get_logger().info('Running GN gen...')
         _run_build_process('out\\Default\\gn.exe', 'gen', 'out\\Default', '--fail-on-unused-args')
 
-    if not args.ci or not os.path.exists('third_party\\rust-toolchain\\bin\\bindgen.exe'):
-        # Build bindgen
+    # Build bindgen
+    if not args.skip_bindgen and not os.path.exists('third_party\\rust-toolchain\\bin\\bindgen.exe'):
+        get_logger().info('Building bindgen...')
         _run_build_process(
             sys.executable,
             'tools\\rust\\build_bindgen.py')
 
     # Run ninja
+    get_logger().info('Running ninja build...')
     if args.ci:
         _run_build_process_timeout('third_party\\ninja\\ninja.exe', '-C', 'out\\Default', 'chrome',
-                                   'chromedriver', 'mini_installer', timeout=3.5*60*60)
+                                'chromedriver', 'mini_installer', timeout=3.5*60*60)
         # package
+        get_logger().info('Packaging build...')
         os.chdir(_ROOT_DIR)
         subprocess.run([sys.executable, 'package.py'])
     else:
         _run_build_process('third_party\\ninja\\ninja.exe', '-C', 'out\\Default', 'chrome',
-                           'chromedriver', 'mini_installer')
+                        'chromedriver', 'mini_installer')
+
+    get_logger().info('Build completed successfully')
 
 
 if __name__ == '__main__':
